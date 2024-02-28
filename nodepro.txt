@@ -1,1 +1,243 @@
-edu-service-smallexam/exReportAnswerHomework/update__ExReportAnswerHomework
+import DiffView from '@/components/diff-view';
+import { useHighlight } from '@/components/diff-view/highlight/use-highlight';
+import { CurrentExpandParam, ExpandBlobDirection, Hunk, IDiffLineType, IDiffType, IViewType } from '@/components/diff-view/type';
+import { getLinePrefix } from '@/components/diff-view/utils/get-line-prefix';
+import { CommentSubjectType, ReviewCommentRequestProps, DiffFile, DiffLine, DiffSection, FileChangesPage, ReviewCommentProps, ReviewEvent, ReviewCommentRaw } from '@/types';
+import { isArray, isEmpty } from 'lodash';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Loading, Message, MessagePlugin } from 'tdesign-react';
+import MarkdownEditorWithButtons from '../../MarkdownEditorWithButtons';
+import { useAppSelector } from '@/redux';
+import { ACTION_TYPE, useDiffContext } from '@/components/diff-view/context';
+import { useFileChangeContext } from '../context';
+import { LineNumDirection, useDiffLineSelectedContext } from '@/components/diff-view/context/diff-line-seleted';
+import { usePullDetailContext } from '@/components/slug/pulls/context/detail';
+import CodeReviewComments from '../../CodeReviewComments';
+import { getCommentRowKey } from '@/components/diff-view/utils/get-comment-row-key';
+import { submitReview } from './review.utils';
+import { fetchExpandBlob } from '@/api/repos/fetch-expand-blob';
+import { logger } from '@/lib/logger';
+import { generateHunkContent } from '@/components/diff-view/utils/generate-hunk-content';
+import { generateHunkHeader } from '@/components/diff-view/utils/generate-hunk-header';
+
+export const DiffFileBody = React.memo(({
+  diffFile,
+  sections,
+  viewType,
+  className,
+  comments,
+}: DiffFileBodyProps) => {
+  const slugUserName = useAppSelector((state) => state.global.authInfo?.userName) || '';
+  const slug = useAppSelector((state) => state.global.authInfo?.slugName) || '';
+  const { state, dispatch: fileChangeDispatch } = useFileChangeContext();
+  const mode = useMemo(() => state.mode, [state.mode]);
+  const { state: pullState, dispatch: pullDispatch } = usePullDetailContext();
+
+  const diffFileSection = useMemo(() => {
+    if (!sections) return { lines: [] };
+    let lines: DiffLine[] = [];
+    (sections || []).forEach((item) => {
+      if (item.lines && isArray(item.lines)) lines = lines.concat(item.lines);
+    });
+    const formatLines = lines?.map((line, index) => {
+      const prefix = getLinePrefix(line);
+      return {
+        index,
+        type: line.type,
+        text: line.content,
+        leftNo: line.left_line_number,
+        rightNo: line.right_line_number,
+        prefix,
+        // fileAchorID,
+      };
+    });
+    return {
+      lines: formatLines,
+    };
+  }, [sections]);
+
+  const lineComments = useMemo(() => {
+    if (!!comments.length) return comments.filter((item) => item.subject_type === CommentSubjectType.line);
+    return [];
+  }, [comments]);
+
+  const [loading, setLoading] = useState(false);
+  const [hunks, setHunks] = useState<Hunk[][]>([]);
+  const { getHighlightHunk } = useHighlight();
+  const getHunks = async () => {
+    setLoading(true);
+    const lines = await getHighlightHunk(diffFileSection.lines, '');
+    setHunks(lines);
+    setLoading(false);
+  };
+
+  const handleExpand = async (expandParam: CurrentExpandParam, currentHeader: Hunk) => {
+    try {
+      const params = {
+        slug,
+        commit_hash: diffFile.change_type === IDiffType.delete ? state.commitInfo.base_commit : state.commitInfo.head_commit,
+        path: diffFile.path,
+        previous_line_num: expandParam.direction === ExpandBlobDirection.down ? expandParam.prevLineRightNo : expandParam.nextLineRightNo,
+        expand_line_size: expandParam.expandLineSize,
+        expand_direction: expandParam.direction,
+      };
+      const { result, error } = await fetchExpandBlob(params);
+      if (result) {
+        const code = (result.lines || []).slice(0, expandParam.count);
+        if (code.length === 0) return null;
+        const newHunks = generateHunkContent(code, expandParam) as Hunk[];
+        // @ts-ignore
+        let newHeader: Hunk = code.length < expandParam.expandLineSize ? {} : generateHunkHeader(currentHeader, code?.length);
+        // @ts-ignore
+        if (!newHeader.type) newHeader = {};
+        const newHunksWithHighlight = await getHighlightHunk([newHeader, ...newHunks], '');
+        return newHunksWithHighlight;
+      }
+      throw error;
+    } catch (error) {
+      console.error(error);
+      logger.error(error);
+      MessagePlugin.error('代码块展开失败');
+      return [];
+    }
+  };
+
+  useEffect(() => {
+    getHunks();
+  }, [diffFileSection]);
+
+  if (!!loading) {
+    return (
+      <div className='flex justify-center items-center w-full h-8'>
+        <Loading size="16px" />
+      </div>
+    );
+  }
+
+  // diff 文件行的评论组件
+  const CommentDom = ({ line, direction, commentKey }: { line: Hunk, direction: LineNumDirection, commentKey: string; }) => {
+    const { dispatch: diffDispatch, state: diffState } = useDiffContext();
+    const { state: diffLineState } = useDiffLineSelectedContext();
+
+    // 找到对应行的评论列表
+    const lineKeyComments = useMemo(() => {
+      if (!!comments.length) return comments.filter((item) => {
+        const lineKey = getCommentRowKey(item.end_line || -1000, item.end_side as LineNumDirection);
+        return item.subject_type === CommentSubjectType.line && lineKey === commentKey;
+      });
+      return [];
+    }, [lineComments, commentKey]);
+
+    const submit = async (content: string, event: ReviewEvent) => {
+      // 大于一行的选中算作多行选中
+      const isMultiSelectedComment = diffLineState.selected.length > 1;
+      const isLeft = direction === LineNumDirection.left;
+
+      const singleNum = isLeft ? line.leftNo : line.rightNo;
+      const singleSide = isLeft ? LineNumDirection.left : LineNumDirection.right;
+
+      const endLine = isMultiSelectedComment ? diffLineState.endNum : singleNum;
+      const startLine = isMultiSelectedComment ? diffLineState.startNum : singleNum;
+      const endSide = isMultiSelectedComment ? diffLineState.endDirection : singleSide;
+      const startSide = isMultiSelectedComment ? diffLineState.startDirection : singleSide;
+      const comment: ReviewCommentRequestProps = {
+        body: content,
+        end_line: endLine,
+        end_side: endSide,
+        start_line: startLine,
+        start_side: startSide,
+        path: diffFile.path,
+        subject_type: CommentSubjectType.line,
+      };
+      const params: ReviewCommentProps = {
+        comment,
+        event,
+      };
+      await submitReview({
+        slug,
+        pullId: pullState.id,
+        reviewId: pullState.isPending ? pullState.pendingReviewId : '',
+        params,
+        isPending: pullState.isPending,
+        pendingCommentCount: pullState.pendingCommentCount,
+        commentKey,
+        path: diffFile.path,
+        diffDispatch,
+        fileChangeDispatch,
+        pullDispatch,
+      });
+    };
+
+    const isShowComment = useMemo(() => {
+      return diffState.commentRowKeys.find((item) => item.key === commentKey)?.is_show_comment;
+    }, [diffState.commentRowKeys]);
+    console.log('123', commentKey);
+    
+    return (
+      <>
+        {!!lineKeyComments.length && (
+          <CodeReviewComments
+            slugName={slug}
+            // diffFiles={[DIFF_FILE]}
+            // @ts-ignore
+            comments={lineKeyComments}
+            /** 开启 pending 评审时，评审按钮不展示 */
+            isReview={!pullState.isPending}
+          />
+        )}
+        {isShowComment && (
+          <MarkdownEditorWithButtons
+            slugName={slug}
+            /** 开启 pending 评审时，评审按钮不展示 */
+            isReview={!pullState.isPending}
+            onReview={(content) => submit(content, ReviewEvent.pending)}
+            onChange={(content) => submit(content, ReviewEvent.comment)}
+            onCancel={() => {
+              diffDispatch({
+                type: ACTION_TYPE.HIDE_LINE_COMMENT,
+                payload: {
+                  commentKey,
+                  isShow: !!lineKeyComments.length,
+                  isShowComment: false,
+                },
+              });
+            }}
+          />
+        )}
+      </>
+    );
+  };
+
+  return (
+    <DiffView
+      onExpand={handleExpand}
+      className={className}
+      diffType={diffFile.change_type}
+      hunks={hunks}
+      file={diffFile}
+      viewType={viewType}
+      comments={lineComments}
+      CommentDom={CommentDom}
+      /**
+       * 1. 目前禁用掉 compare 页面和 commit 页面的评论
+       * 2. pr 页面，如果是自己也禁用掉
+       */
+      hideLineCommentIcon={(
+        mode === FileChangesPage.compare
+        || mode === FileChangesPage.commit)
+        || (mode === FileChangesPage.pullDetail && slugUserName === pullState.username)}
+    />
+  );
+});
+
+export interface DiffFileBodyProps {
+  comments: ReviewCommentRaw[];
+  /** diff 文件信息 */
+  diffFile: DiffFile;
+  /** diff 代码部分 */
+  sections: DiffSection[] | null;
+  viewType: IViewType;
+  className?: string;
+  /** fileAchorID 主要作用于文件行的锚点 */
+  fileAchorID?: string;
+}
